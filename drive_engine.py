@@ -9,11 +9,15 @@ Usage:
     python3 drive_engine.py status          # Show all drive states
     python3 drive_engine.py hungry          # List drives above threshold
     python3 drive_engine.py pick            # Pick the best action to take
-    python3 drive_engine.py satisfy <drive> [note]  # Record satisfaction
+    python3 drive_engine.py satisfy <drive> [--size small|medium|large] [note]
+                                            # Record satisfaction (magnitude-weighted)
     python3 drive_engine.py journal [n]     # Show last n journal entries
     python3 drive_engine.py tick            # Advance hunger by elapsed time
     python3 drive_engine.py stats [days]    # Activity stats (default 7 days)
     python3 drive_engine.py streak          # Consecutive-day streaks per drive
+    python3 drive_engine.py review [days]   # Self-review: propose parameter changes
+                                            # (writes a proposal for human approval;
+                                            #  NEVER self-applies)
 """
 
 import json
@@ -30,6 +34,13 @@ CONFIG_PATH = os.path.join(WORKSPACE, "config", "drives.yaml")
 STATE_PATH = os.path.join(WORKSPACE, "memory", "drive_state.json")
 JOURNAL_PATH = os.path.join(WORKSPACE, "memory", "drive_journal.md")
 JOURNAL_JSONL_PATH = os.path.join(WORKSPACE, "memory", "drive_journal.jsonl")
+REVIEW_PROPOSAL_PATH = os.path.join(WORKSPACE, "reports", "state", "drive_review_proposal.md")
+
+# Magnitude tiers for satisfy: the numbers finally learn what the prose knows.
+# small  = routine/low-effort action (tidying, a quick check that found nothing new)
+# medium = a normal solid action (default; matches v1.0 behavior)
+# large  = high-impact/high-effort (caught a silent outage, shipped something real)
+SIZE_MULTIPLIERS = {"small": 0.5, "medium": 1.0, "large": 1.5}
 
 
 def load_config():
@@ -149,8 +160,8 @@ def pick_action(state, config):
     }
 
 
-def satisfy_drive(state, config, drive_name, note=""):
-    """Record satisfaction for a drive."""
+def satisfy_drive(state, config, drive_name, note="", size="medium"):
+    """Record satisfaction for a drive, weighted by action magnitude."""
     drives_config = config.get("drives", {})
     dcfg = drives_config.get(drive_name)
     if not dcfg:
@@ -159,7 +170,8 @@ def satisfy_drive(state, config, drive_name, note=""):
 
     ds = state.get(drive_name, init_drive(drive_name, dcfg))
 
-    satiation = dcfg.get("satiation", 50)
+    mult = SIZE_MULTIPLIERS.get(size, 1.0)
+    satiation = dcfg.get("satiation", 50) * mult
     ds["hunger"] = max(0.0, ds["hunger"] - satiation)
     ds["satisfaction"] = min(100.0, ds["satisfaction"] + satiation)
     ds["last_action"] = time.time()
@@ -169,12 +181,13 @@ def satisfy_drive(state, config, drive_name, note=""):
     state[drive_name] = ds
 
     # Write to journal (markdown for humans, JSONL mirror for tools)
-    journal_entry = format_journal_entry(drive_name, dcfg, note)
+    journal_entry = format_journal_entry(drive_name, dcfg, note, size=size)
     append_journal(journal_entry)
     append_journal_jsonl({
         "ts": datetime.now().isoformat(timespec="seconds"),
         "drive": drive_name,
-        "reward": satiation,
+        "reward": round(satiation, 1),
+        "size": size,
         "hunger_after": round(ds["hunger"], 2),
         "satisfaction_after": round(ds["satisfaction"], 2),
         "action_count": ds["action_count"],
@@ -184,12 +197,15 @@ def satisfy_drive(state, config, drive_name, note=""):
     return state, satiation
 
 
-def format_journal_entry(drive_name, dcfg, note=""):
+def format_journal_entry(drive_name, dcfg, note="", size="medium"):
     """Format a satisfaction journal entry."""
     now = datetime.now()
     satisfaction_log = dcfg.get("satisfaction_log", "")
+    title = f"### {now.strftime('%Y-%m-%d %H:%M')} — {drive_name.title()}"
+    if size != "medium":
+        title += f" ({size})"
     lines = [
-        f"### {now.strftime('%Y-%m-%d %H:%M')} — {drive_name.title()}",
+        title,
         f"*{satisfaction_log}*",
     ]
     if note:
@@ -439,14 +455,142 @@ def cmd_tick(state, config, quiet=False):
     cmd_status(state, config)
 
 
-def cmd_satisfy(state, config, drive_name, note=""):
+def cmd_satisfy(state, config, drive_name, note="", size="medium"):
     """Record satisfaction."""
-    state, reward = satisfy_drive(state, config, drive_name, note)
+    state, reward = satisfy_drive(state, config, drive_name, note, size=size)
     save_state(state)
     drives_config = config.get("drives", {})
     dcfg = drives_config.get(drive_name, {})
-    print(f"✨ {dcfg.get('satisfaction_log', 'Satisfied.')}")
-    print(f"   +{reward} satisfaction  │  hunger now: {state[drive_name]['hunger']:.1f}")
+    tag = "" if size == "medium" else f" [{size}]"
+    print(f"✨ {dcfg.get('satisfaction_log', 'Satisfied.')}{tag}")
+    print(f"   +{reward:.0f} satisfaction  │  hunger now: {state[drive_name]['hunger']:.1f}")
+
+
+def cmd_review(state, config, days=90):
+    """Quarterly self-review: analyze the journal and PROPOSE parameter changes.
+
+    Writes a human-readable proposal to reports/state/drive_review_proposal.md.
+    Deliberately has no --apply flag: parameter changes go through the human.
+    Self-modification with a keeper.
+    """
+    drives_config = config.get("drives", {})
+    if not os.path.exists(JOURNAL_JSONL_PATH):
+        print("No JSONL journal yet — nothing to review.")
+        return
+
+    cutoff = datetime.now().timestamp() - days * 86400
+    counts = {name: 0 for name in drives_config}
+    sizes = {name: {"small": 0, "medium": 0, "large": 0} for name in drives_config}
+    last_seen = {name: None for name in drives_config}
+
+    with open(JOURNAL_JSONL_PATH) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            drive = rec.get("drive")
+            if drive not in counts:
+                continue
+            try:
+                ts = datetime.fromisoformat(rec.get("ts", "")).timestamp()
+            except ValueError:
+                continue
+            if last_seen[drive] is None or ts > last_seen[drive]:
+                last_seen[drive] = ts
+            if ts >= cutoff:
+                counts[drive] += 1
+                sz = rec.get("size", "medium")
+                if sz in sizes[drive]:
+                    sizes[drive][sz] += 1
+
+    total = sum(counts.values())
+    if total == 0:
+        print(f"No journal activity in the last {days} days — nothing to review.")
+        return
+
+    now_ts = datetime.now().timestamp()
+    proposals = []
+    observations = []
+
+    for name, dcfg in drives_config.items():
+        share = counts[name] / total
+        hunger_rate = dcfg.get("hunger_rate", 2.0)
+        last = last_seen[name]
+        idle_days = (now_ts - last) / 86400 if last else None
+
+        obs = f"- **{name}**: {counts[name]} actions ({share:.0%} share), hunger_rate {hunger_rate}"
+        if idle_days is not None:
+            obs += f", last acted {idle_days:.1f}d ago"
+        observations.append(obs)
+
+        # Heuristic 1: monopoly — one drive eating >40% of all actions
+        if share > 0.40:
+            proposals.append(
+                f"**{name}** holds {share:.0%} of all actions (monopoly threshold 40%). "
+                f"Consider raising its threshold (currently {dcfg.get('threshold', 50)}) "
+                f"by ~10% so cheaper satisfies don't crowd out harder drives."
+            )
+
+        # Heuristic 2: starvation — <8% share suggests hunger_rate too slow to compete
+        if share < 0.08 and counts[name] > 0:
+            new_rate = round(hunger_rate * 1.25, 2)
+            proposals.append(
+                f"**{name}** has only {share:.0%} share. Propose hunger_rate "
+                f"{hunger_rate} → {new_rate} (+25%) so it wins the pick more often."
+            )
+
+        # Heuristic 3: full neglect in window
+        if counts[name] == 0:
+            proposals.append(
+                f"**{name}** took ZERO actions in {days} days. Either raise its "
+                f"hunger_rate meaningfully or discuss whether this drive still fits."
+            )
+
+        # Heuristic 4: size inflation — if >60% of sized actions are 'large',
+        # grading has drifted; large should be rare.
+        sized = sizes[name]["small"] + sizes[name]["large"] + sizes[name]["medium"]
+        if sized >= 10 and sizes[name]["large"] / sized > 0.60:
+            proposals.append(
+                f"**{name}**: {sizes[name]['large']}/{sized} actions graded 'large'. "
+                f"Grade inflation — recalibrate what counts as high-impact."
+            )
+
+    # Build the proposal document
+    lines = [
+        "# Drive System Self-Review",
+        f"*Window: last {days} days • generated {datetime.now().strftime('%Y-%m-%d %H:%M')}*",
+        "",
+        "This is a PROPOSAL. Nothing here is applied automatically — parameter",
+        "changes to `config/drives.yaml` require human approval. Self-modification",
+        "with a keeper.",
+        "",
+        "## Observations",
+        *observations,
+        "",
+        "## Proposed changes",
+    ]
+    if proposals:
+        lines += [f"{i+1}. {p}" for i, p in enumerate(proposals)]
+    else:
+        lines.append("No changes proposed — the current parameters look balanced.")
+    lines += [
+        "",
+        "## To apply",
+        "Review with your human, edit `config/drives.yaml` together, and note the",
+        "decision in the daily memory file. The engine never edits its own config.",
+        "",
+    ]
+
+    os.makedirs(os.path.dirname(REVIEW_PROPOSAL_PATH), exist_ok=True)
+    with open(REVIEW_PROPOSAL_PATH, "w") as f:
+        f.write("\n".join(lines))
+
+    print("\n".join(lines))
+    print(f"[proposal written to {REVIEW_PROPOSAL_PATH}]")
 
 
 if __name__ == "__main__":
@@ -473,10 +617,20 @@ if __name__ == "__main__":
         cmd_tick(state, config, quiet=("--quiet" in sys.argv or "-q" in sys.argv))
     elif cmd == "satisfy":
         if len(sys.argv) < 3:
-            print("Usage: drive_engine.py satisfy <drive> [note]")
+            print("Usage: drive_engine.py satisfy <drive> [--size small|medium|large] [note]")
             sys.exit(1)
-        note = " ".join(sys.argv[3:]) if len(sys.argv) > 3 else ""
-        cmd_satisfy(state, config, sys.argv[2], note)
+        rest = sys.argv[3:]
+        size = "medium"
+        if "--size" in rest:
+            i = rest.index("--size")
+            if i + 1 < len(rest) and rest[i + 1] in SIZE_MULTIPLIERS:
+                size = rest[i + 1]
+                rest = rest[:i] + rest[i + 2:]
+            else:
+                print(f"--size must be one of: {', '.join(SIZE_MULTIPLIERS)}")
+                sys.exit(1)
+        note = " ".join(rest)
+        cmd_satisfy(state, config, sys.argv[2], note, size=size)
     elif cmd == "journal":
         n = int(sys.argv[2]) if len(sys.argv) > 2 else 10
         cmd_journal(n)
@@ -485,6 +639,9 @@ if __name__ == "__main__":
         cmd_stats(state, config, days)
     elif cmd == "streak":
         cmd_streak(config)
+    elif cmd == "review":
+        days = int(sys.argv[2]) if len(sys.argv) > 2 else 90
+        cmd_review(state, config, days)
     else:
         print(f"Unknown command: {cmd}")
         print(__doc__)
