@@ -10,6 +10,8 @@ periodic wakes, and are sated by real actions recorded in an append-only journal
 
 No fine-tuning. No reward model. ~600 lines of Python + YAML.
 
+**🔥 Experience it: [the story of a spark becoming a bonfire](https://sunkencity999.github.io/drive-system/)**
+
 **📄 Read the paper: [PAPER.md](PAPER.md)** — architecture, tuning parameters,
 and results from 109 days / 547 self-initiated actions of continuous operation
 in a real household deployment.
