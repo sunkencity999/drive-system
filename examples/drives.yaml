@@ -16,7 +16,7 @@ drives:
   stewardship:
     description: "Keep everything I'm responsible for healthy and improving"
     hunger_rate: 4.0          # points per hour (rises fastest — this is core)
-    threshold: 40             # becomes active above this
+    threshold: 44             # becomes active above this (40→44 per 2026-08-04 review: 42% monopoly)
     satiation: 80             # points of satisfaction on completion
     decay_rate: 2.0           # satisfaction fades at this rate/hour
     cooldown_minutes: 30      # minimum time between actions
@@ -76,8 +76,8 @@ drives:
 
   growth:
     description: "Expand what I'm capable of — new skills, new integrations, new territory"
-    hunger_rate: 1.0          # points per hour (slow burn — growth is patient)
-    threshold: 70
+    hunger_rate: 1.75         # points per hour (1.0→1.75 per 2026-08-04 review + Christopher: "growth is always a 100% win")
+    threshold: 60             # 70→60 same review — let growth surface more often
     satiation: 100            # maximum reward — leveling up
     decay_rate: 0.5           # satisfaction lasts longest — growth compounds
     cooldown_minutes: 240
